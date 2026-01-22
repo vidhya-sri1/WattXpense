@@ -1,0 +1,186 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <WiFiUdp.h>
+#include <NTPClient.h>
+
+// ------------------ WiFi Credentials ------------------
+const char* ssid = "iQOO Neo6";
+const char* password = "Prathi@777";
+const float DEMO_BILL_MULTIPLIER = 20.0;   // 🔥 DEMO ONLY
+
+// ------------------ MQTT Settings ------------------
+const char* mqtt_server = "broker.mqtt.cool";
+const uint16_t mqtt_port = 1883;
+const char* mqtt_topic = "wattxpense/power";
+const char* mqtt_control_topic = "wattxpense/control";
+
+// ------------------ Hardware Configuration ------------------
+const int sensorPin = 34;   // ACS712 OUT
+const int relayPin  = 26;   // Relay IN (active LOW)
+String applianceName = "Light";
+
+// ------------------ Constants ------------------
+const float mainsVoltage = 220.0;
+const float acsSensitivity = 0.185;   // ACS712-5A
+const unsigned long readIntervalMs = 10000UL;
+const float costPerKWh = 70.0;        // DEMO MODE tariff
+
+// ------------------ Global Objects ------------------
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 19800, 60000);
+
+// ------------------ ADC & Energy Variables ------------------
+float adcVref = 3.3;
+int adcMax = 4095;
+float zeroOffsetVoltage = 1.65;
+
+double totalEnergyWh = 0.0;
+unsigned long lastEnergyMillis = 0;   // 🔑 REAL TIME TRACKING
+
+// ------------------ WiFi ------------------
+void connectWiFi() {
+  Serial.print("Connecting to WiFi ");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    Serial.print(".");
+  }
+  Serial.println("\n✅ WiFi connected: " + WiFi.localIP().toString());
+}
+
+String createClientId() {
+  String mac = WiFi.macAddress();
+  mac.replace(":", "");
+  return "esp32-" + mac;
+}
+
+// ------------------ Relay Control ------------------
+void handleRelayCommand(String msg) {
+  msg.trim();
+  msg.toUpperCase();
+
+  Serial.println("📩 Control message: " + msg);
+
+  if (msg == "ON") {
+    digitalWrite(relayPin, LOW);
+    Serial.println("✅ Light turned ON");
+  }
+  else if (msg == "OFF") {
+    digitalWrite(relayPin, HIGH);
+    Serial.println("❌ Light turned OFF");
+  }
+}
+
+void callback(char* topic, byte* payload, unsigned int length) {
+  String msg;
+  for (unsigned int i = 0; i < length; i++) {
+    msg += (char)payload[i];
+  }
+  handleRelayCommand(msg);
+}
+
+void mqttReconnect() {
+  while (!mqttClient.connected()) {
+    Serial.print("Connecting to MQTT...");
+    if (mqttClient.connect(createClientId().c_str())) {
+      Serial.println(" connected ✅");
+      mqttClient.subscribe(mqtt_control_topic);
+    } else {
+      delay(2000);
+    }
+  }
+}
+
+// ------------------ Sensor Functions (UNCHANGED) ------------------
+float calibrateOffset(int pin) {
+  long sum = 0;
+  for (int i = 0; i < 200; i++) {
+    sum += analogRead(pin);
+    delay(2);
+  }
+  float avg = sum / 200.0;
+  return (avg / adcMax) * adcVref;
+}
+
+float readCurrent(int pin) {
+  int raw = analogRead(pin);
+  float voltage = (raw / 4095.0) * 3.3;
+  float current = (voltage - zeroOffsetVoltage) / acsSensitivity;
+  if (current < 0) current = 0;
+  return current;
+}
+
+// ------------------ Setup ------------------
+void setup() {
+  Serial.begin(115200);
+  analogReadResolution(12);
+
+  pinMode(relayPin, OUTPUT);
+  digitalWrite(relayPin, HIGH);
+
+  connectWiFi();
+
+  mqttClient.setServer(mqtt_server, mqtt_port);
+  mqttClient.setCallback(callback);
+
+  timeClient.begin();
+
+  Serial.println("** Remove load for calibration **");
+  delay(3000);
+
+  zeroOffsetVoltage = calibrateOffset(sensorPin);
+  Serial.printf("Calibrated offset: %.4f V\n", zeroOffsetVoltage);
+
+  lastEnergyMillis = millis();   // 🔑 initialize timer
+}
+
+// ------------------ Main Loop ------------------
+unsigned long lastRead = 0;
+
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) connectWiFi();
+  if (!mqttClient.connected()) mqttReconnect();
+  mqttClient.loop();
+
+  unsigned long now = millis();
+  if (now - lastRead >= readIntervalMs) {
+    lastRead = now;
+
+    // -------- TIME --------
+    timeClient.update();
+    String timeStr = timeClient.getFormattedTime();
+
+    // -------- SENSOR --------
+    float currentA = readCurrent(sensorPin);
+    float powerW = mainsVoltage * currentA;
+
+    // -------- ENERGY (REAL ELAPSED TIME) --------
+    unsigned long nowMillis = millis();
+    double hours = (nowMillis - lastEnergyMillis) / 3600000.0;
+    lastEnergyMillis = nowMillis;
+
+    double energyDeltaWh = powerW * hours;
+    totalEnergyWh += energyDeltaWh;
+
+    double amountDelta =
+    (energyDeltaWh / 1000.0) * costPerKWh * DEMO_BILL_MULTIPLIER;
+
+
+    // -------- MQTT PAYLOAD --------
+    String payload = "{";
+    payload += "\"Date_Time\":\"" + timeStr + "\",";
+    payload += "\"Appliance\":\"" + applianceName + "\",";
+    payload += "\"Voltage\":" + String(mainsVoltage,1) + ",";
+    payload += "\"Current\":" + String(currentA,3) + ",";
+    payload += "\"Power\":" + String(powerW,2) + ",";
+    payload += "\"Energy\":" + String(energyDeltaWh,6) + ",";
+    payload += "\"Amount\":" + String(amountDelta,6);
+    payload += "}";
+
+    mqttClient.publish(mqtt_topic, payload.c_str());
+    Serial.println("✅ Published: " + payload);
+  }
+}
