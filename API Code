@@ -1,0 +1,215 @@
+from fastapi import FastAPI
+import mysql.connector
+from mysql.connector import Error
+from datetime import datetime, date
+from fastapi.responses import StreamingResponse
+import pandas as pd
+import io
+
+app = FastAPI(title="WattXpense API")
+
+# ---------------- DB CONFIG ----------------
+db_config = {
+    "host": "localhost",
+    "user": "root",
+    "password": "prathi777",
+    "database": "WattXpense"
+}
+
+def get_db_connection():
+    return mysql.connector.connect(**db_config)
+
+# -------------------------------------------------
+# 1️⃣ LIVE DATA (last 20 readings)
+# -------------------------------------------------
+@app.get("/data")
+def get_data():
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+
+    cursor.execute("""
+        SELECT id, Date_Time, Appliance, Voltage, Current, Power, Energy, Amount, created_at
+        FROM wattxpense_data
+        ORDER BY id DESC
+        LIMIT 20
+    """)
+
+    data = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return data
+
+# -------------------------------------------------
+# 2️⃣ MONTHLY BILL (₹ – cumulative, correct)
+# -------------------------------------------------
+@app.get("/monthly-bill")
+def get_monthly_bill():
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+
+    cursor.execute("""
+        SELECT IFNULL(SUM(Amount), 0) AS total
+        FROM wattxpense_data
+        WHERE Appliance='Light'
+          AND MONTH(created_at)=MONTH(CURDATE())
+          AND YEAR(created_at)=YEAR(CURDATE())
+    """)
+
+    result = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    return {"total": float(result["total"])}
+# -------------------------------------------------
+# 3️⃣ TOTAL ON TIME (TODAY – hours + minutes)
+# -------------------------------------------------
+@app.get("/on-time")
+def get_on_time():
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+
+    cursor.execute("""
+        SELECT COUNT(*) AS on_count
+        FROM wattxpense_data
+        WHERE Appliance='Light'
+          AND Current > 0
+          AND DATE(created_at)=CURDATE()
+    """)
+
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    seconds = row["on_count"] * 10   # ESP publishes every 10 sec
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+
+    return {
+        "hours": int(hours),
+        "minutes": int(minutes)
+    }
+
+# -------------------------------------------------
+# 4️⃣ WEEKLY BREAKDOWN (MONTH PIE)
+# -------------------------------------------------
+@app.get("/weekly-breakdown")
+def get_weekly_breakdown():
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+
+    cursor.execute("""
+        SELECT 
+            CASE
+                WHEN DAY(created_at) BETWEEN 1 AND 7 THEN 'Week 1'
+                WHEN DAY(created_at) BETWEEN 8 AND 14 THEN 'Week 2'
+                WHEN DAY(created_at) BETWEEN 15 AND 21 THEN 'Week 3'
+                ELSE 'Week 4'
+            END AS week,
+            MAX(Amount) - MIN(Amount) AS total
+        FROM wattxpense_data
+        WHERE Appliance='Light'
+          AND MONTH(created_at)=MONTH(CURDATE())
+          AND YEAR(created_at)=YEAR(CURDATE())
+        GROUP BY week
+    """)
+
+    rows = cursor.fetchall()
+    cursor.close()
+    conn.close()
+
+    result = {
+        "Week 1": 0.0,
+        "Week 2": 0.0,
+        "Week 3": 0.0,
+        "Week 4": 0.0
+    }
+
+    for r in rows:
+        result[r["week"]] = round(float(r["total"]), 2)
+
+    return result
+
+# -------------------------------------------------
+# 5️⃣ BILL GOAL (GET)
+# -------------------------------------------------
+@app.get("/bill-goal")
+def get_bill_goal():
+    month = datetime.now().strftime("%Y-%m")
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+
+    cursor.execute(
+        "SELECT target_amount FROM bill_goal WHERE month=%s",
+        (month,)
+    )
+
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    return {"goal": float(row["target_amount"]) if row else 0.0}
+
+# -------------------------------------------------
+# 6️⃣ BILL GOAL (SET)
+# -------------------------------------------------
+@app.post("/set-bill-goal/{amount}")
+def set_bill_goal(amount: float):
+    month = datetime.now().strftime("%Y-%m")
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("DELETE FROM bill_goal WHERE month=%s", (month,))
+    cursor.execute(
+        "INSERT INTO bill_goal (month, target_amount) VALUES (%s, %s)",
+        (month, amount)
+    )
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    return {"message": "Goal saved", "goal": amount}
+
+# -------------------------------------------------
+# 7️⃣ BILL ALERT (>80%)
+# -------------------------------------------------
+@app.get("/bill-alert")
+def bill_alert():
+    usage = get_monthly_bill()["total"]
+    goal = get_bill_goal()["goal"]
+
+    if goal > 0:
+        percent = round((usage / goal) * 100, 1)
+        return {"alert": percent >= 80, "percent": percent}
+
+    return {"alert": False, "percent": 0}
+
+# -------------------------------------------------
+# 8️⃣ EXPORT MONTHLY CSV
+# -------------------------------------------------
+@app.get("/export-monthly")
+def export_monthly():
+    conn = get_db_connection()
+
+    df = pd.read_sql("""
+        SELECT *
+        FROM wattxpense_data
+        WHERE Appliance='Light'
+          AND MONTH(created_at)=MONTH(CURDATE())
+          AND YEAR(created_at)=YEAR(CURDATE())
+    """, conn)
+
+    conn.close()
+
+    buffer = io.StringIO()
+    df.to_csv(buffer, index=False)
+    buffer.seek(0)
+
+    return StreamingResponse(
+        buffer,
+        media_type="text/csv",
+        headers={
+            "Content-Disposition":
+            "attachment; filename=wattxpense_monthly_report.csv"
+        }
+    )
