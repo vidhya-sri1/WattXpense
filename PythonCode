@@ -1,0 +1,105 @@
+import paho.mqtt.client as mqtt
+import mysql.connector
+import json
+
+# ------------------ MQTT SETTINGS ------------------
+MQTT_BROKER = "broker.mqtt.cool"
+MQTT_PORT = 1883
+TOPIC_POWER = "wattxpense/power"      # ESP32 → Python
+TOPIC_CONTROL = "wattxpense/control"  # Python → ESP32
+
+CURRENT_THRESHOLD = 0.1  # 0.1 A baseline
+
+# ------------------ MYSQL SETTINGS -----------------
+db = mysql.connector.connect(
+    host="localhost",
+    user="root",
+    password="prathi777",
+    database="WattXpense"
+)
+cursor = db.cursor()
+
+# ------------------ MQTT CALLBACK ------------------
+def on_message(client, userdata, msg):
+    try:
+        payload = msg.payload.decode()
+        data = json.loads(payload)
+        print("📩 Received:", data)
+
+        current = float(data.get("Current", 0))
+        voltage = float(data.get("Voltage", 0))
+
+        # 🔑 Energy for THIS 10-sec window (Wh)
+        energy_delta = float(data.get("Energy", 0))
+        amount_delta = float(data.get("Amount", 0))   # ₹ from ESP (demo-scaled)
+
+
+        # ✅ Ignore sensor noise (ONLY current & power)
+        if current < CURRENT_THRESHOLD:
+            current = 0.0
+            power = 0.0
+        else:
+            power = float(data.get("Power", 0))
+
+        sql = """
+            INSERT INTO wattxpense_data
+            (Date_Time, Appliance, Voltage, Current, Power, Energy, Amount)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """
+
+        cursor.execute(sql, (
+            data.get("Date_Time"),
+            data.get("Appliance"),
+            voltage,
+            current,
+            power,
+            energy_delta,
+            amount_delta
+        ))
+
+        db.commit()
+
+        print(
+            f"✅ Saved → {data.get('Appliance')} | "
+            f"I={current} A | P={power} W | ₹={amount_delta:.6f}"
+        )
+
+    except Exception as e:
+        print("❌ Error processing message:", e)
+
+# ------------------ MQTT SETUP ---------------------
+client = mqtt.Client()
+client.on_message = on_message
+
+print("Connecting to MQTT broker...")
+client.connect(MQTT_BROKER, MQTT_PORT, 60)
+client.subscribe(TOPIC_POWER)
+print(f"✅ Subscribed to topic: {TOPIC_POWER}")
+
+client.loop_start()
+
+# ------------------ CONTROL CONSOLE ----------------
+print("\n--- WattXpense MQTT Control Console ---")
+print("Commands:")
+print("  ON   → Turn light ON")
+print("  OFF  → Turn light OFF")
+print("  exit → Quit\n")
+
+while True:
+    cmd = input("Command: ").strip().upper()
+
+    if cmd == "EXIT":
+        print("👋 Exiting...")
+        break
+
+    if cmd not in ["ON", "OFF"]:
+        print("⚠️ Invalid command. Use ON or OFF.")
+        continue
+
+    client.publish(TOPIC_CONTROL, cmd)
+    print(f"🔘 Sent command → {cmd}")
+
+# ------------------ CLEANUP ------------------------
+client.loop_stop()
+client.disconnect()
+db.close()
