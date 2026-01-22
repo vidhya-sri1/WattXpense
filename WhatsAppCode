@@ -1,0 +1,100 @@
+import time
+import os
+import mysql.connector
+from datetime import datetime
+from twilio.rest import Client
+
+# ---------------- TWILIO (FROM ENV VARS) ----------------
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+WHATSAPP_TO = f"whatsapp:{os.getenv('TWILIO_WHATSAPP')}"
+WHATSAPP_FROM = "whatsapp:+14155238886"  # Twilio Sandbox
+
+client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+# ---------------- DB CONFIG ----------------
+db_config = {
+    "host": "localhost",
+    "user": "root",
+    "password": "prathi777",
+    "database": "WattXpense"
+}
+
+CHECK_INTERVAL = 600  # 10 minutes
+
+# ---------------- MAIN LOOP ----------------
+while True:
+    try:
+        conn = mysql.connector.connect(**db_config)
+        cursor = conn.cursor(dictionary=True)
+
+        month = datetime.now().strftime("%Y-%m")
+
+        # 1️⃣ Get bill goal + alert status
+        cursor.execute(
+            "SELECT target_amount, alert_sent FROM bill_goal WHERE month=%s",
+            (month,)
+        )
+        goal_row = cursor.fetchone()
+
+        if not goal_row or goal_row["target_amount"] == 0:
+            print("ℹ️ No bill goal set yet")
+            cursor.close()
+            conn.close()
+            time.sleep(CHECK_INTERVAL)
+            continue
+
+        goal = goal_row["target_amount"]
+        alert_sent = goal_row["alert_sent"]
+
+        # 2️⃣ Get monthly usage
+        cursor.execute("""
+            SELECT IFNULL(SUM(Amount), 0) AS total
+            FROM wattxpense_data
+            WHERE Appliance='Light'
+              AND MONTH(Date_Time)=MONTH(CURDATE())
+              AND YEAR(Date_Time)=YEAR(CURDATE())
+        """)
+        usage = cursor.fetchone()["total"]
+
+        percent = (usage / goal) * 100
+
+        # 3️⃣ Send alert if crossed 80% and not sent yet
+        if percent >= 80 and not alert_sent:
+            message = f"""
+⚡ WattXpense Alert
+
+Your electricity bill has crossed 80% of your monthly limit.
+
+💡 Device: Light
+💰 Used: ₹{usage:.2f}
+🎯 Limit: ₹{goal:.2f}
+📊 Usage: {percent:.1f}%
+
+Please monitor usage.
+            """
+
+            client.messages.create(
+                from_=WHATSAPP_FROM,
+                to=WHATSAPP_TO,
+                body=message
+            )
+
+            cursor.execute(
+                "UPDATE bill_goal SET alert_sent=TRUE WHERE month=%s",
+                (month,)
+            )
+            conn.commit()
+
+            print("📲 WhatsApp alert sent successfully!")
+
+        else:
+            print(f"✅ Usage OK: {percent:.1f}%")
+
+        cursor.close()
+        conn.close()
+
+    except Exception as e:
+        print("❌ Alert error:", e)
+
+    time.sleep(CHECK_INTERVAL)
